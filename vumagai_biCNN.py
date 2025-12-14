@@ -75,7 +75,7 @@ dataset = dataset.shuffle(buffer_size=len(image_paths), reshuffle_each_iteration
 
 data_augmentation = tf.keras.Sequential([
     layers.RandomFlip("horizontal"),          # random horizontal flip
-#    layers.RandomRotation(0.1),            
+    #layers.RandomRotation(0.1),            
 #    layers.RandomZoom(0.1),              
 #    layers.RandomContrast(0.1),           
 #    layers.RandomTranslation(0.1, 0.1),      
@@ -131,37 +131,181 @@ x -> a tensor
 def L2_norm(x, axis=-1):
 
     return keras.backend.l2_normalize(x, axis=axis)
+    
+class Localization(tf.keras.layers.Layer):
+    def __init__(self):
+        super(Localization, self).__init__()
+        self.pool1 = tf.keras.layers.MaxPool2D()
+        self.conv1 = tf.keras.layers.Conv2D(20, [5, 5], activation='relu')
+        self.pool2 = tf.keras.layers.MaxPool2D()
+        self.conv2 = tf.keras.layers.Conv2D(20, [5, 5], activation='relu')
+        self.flatten = tf.keras.layers.Flatten()
+        self.fc1 = tf.keras.layers.Dense(20, activation='relu')
+        self.fc2 = tf.keras.layers.Dense(6, activation=None, bias_initializer=tf.keras.initializers.constant([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]), kernel_initializer='zeros')
+
+    def build(self, input_shape):
+        print("Building Localization Network with input shape:", input_shape)
+
+    def compute_output_shape(self, input_shape):
+        return [None, 6]
+
+    def call(self, inputs):
+        x = self.conv1(inputs)
+        x = self.pool1(x)
+        x = self.conv2(x)
+        x = self.pool2(x)
+        x = self.flatten(x)
+        x = self.fc1(x)
+        theta = self.fc2(x)
+        theta = tf.keras.layers.Reshape((2, 3))(theta)
+        return theta
+
+class BilinearInterpolation(tf.keras.layers.Layer):
+    def __init__(self, height=40, width=40):
+        super(BilinearInterpolation, self).__init__()
+        self.height = height
+        self.width = width
+
+    def compute_output_shape(self, input_shape):
+        return [None, self.height, self.width, 1]
+
+    def get_config(self):
+        return {
+            'height': self.height,
+            'width': self.width,
+        }
+    
+    def build(self, input_shape):
+        print("Building Bilinear Interpolation Layer with input shape:", input_shape)
+
+    def advance_indexing(self, inputs, x, y):
+        '''
+        Numpy like advance indexing is not supported in tensorflow, hence, this function is a hack around the same method
+        '''        
+        shape = tf.shape(inputs)
+        batch_size, _, _ = shape[0], shape[1], shape[2]
+        
+        batch_idx = tf.range(0, batch_size)
+        batch_idx = tf.reshape(batch_idx, (batch_size, 1, 1))
+        b = tf.tile(batch_idx, (1, self.height, self.width))
+        indices = tf.stack([b, y, x], 3)
+        return tf.gather_nd(inputs, indices)
+
+    def call(self, inputs):
+        images, theta = inputs
+        homogenous_coordinates = self.grid_generator(batch=tf.shape(images)[0])
+        return self.interpolate(images, homogenous_coordinates, theta)
+
+    def grid_generator(self, batch):
+        x = tf.linspace(-1, 1, self.width)
+        y = tf.linspace(-1, 1, self.height)
+            
+        xx, yy = tf.meshgrid(x, y)
+        xx = tf.reshape(xx, (-1,))
+        yy = tf.reshape(yy, (-1,))
+        homogenous_coordinates = tf.stack([xx, yy, tf.ones_like(xx)])
+        homogenous_coordinates = tf.expand_dims(homogenous_coordinates, axis=0)
+        homogenous_coordinates = tf.tile(homogenous_coordinates, [batch, 1, 1])
+        homogenous_coordinates = tf.cast(homogenous_coordinates, dtype=tf.float32)
+        return homogenous_coordinates
+    
+    def interpolate(self, images, homogenous_coordinates, theta):
+
+        with tf.name_scope("Transformation"):
+            transformed = tf.matmul(theta, homogenous_coordinates)
+            transformed = tf.transpose(transformed, perm=[0, 2, 1])
+            transformed = tf.reshape(transformed, [-1, self.height, self.width, 2])
+                
+            x_transformed = transformed[:, :, :, 0]
+            y_transformed = transformed[:, :, :, 1]
+                
+            x = ((x_transformed + 1.) * tf.cast(self.width, dtype=tf.float32)) * 0.5
+            y = ((y_transformed + 1.) * tf.cast(self.height, dtype=tf.float32)) * 0.5
+
+        with tf.name_scope("VariableCasting"):
+            x0 = tf.cast(tf.math.floor(x), dtype=tf.int32)
+            x1 = x0 + 1
+            y0 = tf.cast(tf.math.floor(y), dtype=tf.int32)
+            y1 = y0 + 1
+
+            x0 = tf.clip_by_value(x0, 0, self.width-1)
+            x1 = tf.clip_by_value(x1, 0, self.width-1)
+            y0 = tf.clip_by_value(y0, 0, self.height-1)
+            y1 = tf.clip_by_value(y1, 0, self.height-1)
+            x = tf.clip_by_value(x, 0, tf.cast(self.width, dtype=tf.float32)-1.0)
+            y = tf.clip_by_value(y, 0, tf.cast(self.height, dtype=tf.float32)-1)
+
+        with tf.name_scope("AdvanceIndexing"):
+            Ia = self.advance_indexing(images, x0, y0)
+            Ib = self.advance_indexing(images, x0, y1)
+            Ic = self.advance_indexing(images, x1, y0)
+            Id = self.advance_indexing(images, x1, y1)
+
+        with tf.name_scope("Interpolation"):
+            x0 = tf.cast(x0, dtype=tf.float32)
+            x1 = tf.cast(x1, dtype=tf.float32)
+            y0 = tf.cast(y0, dtype=tf.float32)
+            y1 = tf.cast(y1, dtype=tf.float32)
+                            
+            wa = (x1-x) * (y1-y)
+            wb = (x1-x) * (y-y0)
+            wc = (x-x0) * (y1-y)
+            wd = (x-x0) * (y-y0)
+
+            wa = tf.expand_dims(wa, axis=3)
+            wb = tf.expand_dims(wb, axis=3)
+            wc = tf.expand_dims(wc, axis=3)
+            wd = tf.expand_dims(wd, axis=3)
+                        
+        return tf.math.add_n([wa*Ia + wb*Ib + wc*Ic + wd*Id])
 
 
 def bilinear_cnn_model(input_shape=(imgsize, imgsize, 3), num_classes=100):
 
     inputs = tf.keras.Input(shape=input_shape)
     
+    # ---- Spatial Transformer ----
+    theta = Localization()(inputs)
+    transformed = BilinearInterpolation(height=imgsize, width=imgsize)([inputs, theta])
+    
+    vgg_A_input = tf.keras.Input(shape=input_shape)
+    vgg_B_input = tf.keras.Input(shape=input_shape)
+
+    vgg_A = keras.applications.VGG16(include_top=False, weights="imagenet")
+    vgg_B = keras.applications.VGG16(include_top=False, weights="imagenet")
+    
+    #for layer in vgg_B.layers:
+    #	layer._name = layer.name + "_second"
+    
     # Two parallel VGG16 backbones
-    model_detector = keras.applications.vgg16.VGG16(
-                            input_tensor=inputs, 
-                            include_top=False,
-                            weights='imagenet')
+    #model_detector = keras.applications.vgg16.VGG16(
+    #                        input_tensor=transformed, 
+    #                        include_top=False,
+    #                        weights='imagenet')
     
-    model_detector2 = keras.applications.vgg16.VGG16(
-                            input_tensor=inputs, 
-                            include_top=False,
-                            weights='imagenet')
+    #model_detector2 = keras.applications.vgg16.VGG16(
+    #                        input_tensor=transformed, 
+    #                        include_top=False,
+    #                        weights='imagenet')
     
-    model_detector2 = keras.models.Sequential(layers=model_detector2.layers)
+    vgg_B = keras.models.Sequential(layers=vgg_B.layers)
     
-    for i, layer in enumerate(model_detector2.layers):
+    for i, layer in enumerate(vgg_B.layers):
         layer._name = layer.name  +"_second"
     
-    model2 = keras.models.Model(inputs=[inputs], outputs = [model_detector2.layers[-1].output])
+    #model2 = keras.models.Model(inputs=[inputs], outputs = [model_detector2.layers[-1].output])
     
-    x = model_detector.layers[17].output
-    z = model_detector.layers[17].output_shape
-    y = model2.layers[17].output
+    #x = model_detector.layers[17].output
+    #z = model_detector.layers[17].output_shape
+    #y = model2.layers[17].output
     
-    print(model_detector.summary())
+    x = vgg_A(transformed)
+    y = vgg_B(transformed)
+    z = x.shape
     
-    print(model2.summary())
+    #print(model_detector.summary())
+    
+    #print(model2.summary())
     
 #    rehape to (batch_size, total_pixels, filter_size)
     x = layers.Reshape([z[1] * z[2] , z[-1]])(x)   
@@ -194,10 +338,10 @@ def bilinear_cnn_model(input_shape=(imgsize, imgsize, 3), num_classes=100):
     
     
 #   Freeze VGG layers
-    for layer in model_detector.layers:
+    for layer in vgg_A.layers:
         layer.trainable = False
         
-    sgd = keras.optimizers.SGD(learning_rate=1.0, momentum=0.9, nesterov=True)
+    sgd = keras.optimizers.SGD(learning_rate=0.000000001, momentum=0.9, nesterov=True)
 
     model_bilinear.compile(loss="sparse_categorical_crossentropy", 
                            optimizer=sgd,
@@ -211,27 +355,27 @@ def bilinear_cnn_model(input_shape=(imgsize, imgsize, 3), num_classes=100):
 model = bilinear_cnn_model(input_shape=(imgsize, imgsize, 3), num_classes=len(label_to_index))
 
 
-sgd = keras.optimizers.SGD(learning_rate=0.25, momentum=0.9, nesterov=True)
+#sgd = keras.optimizers.SGD(learning_rate=0.000000000000001, momentum=0.9, nesterov=True)
                                
 model.compile(loss="sparse_categorical_crossentropy", 
-	optimizer=sgd,
+	optimizer=tf.keras.optimizers.Adam(learning_rate=0.25e-4),
 	metrics=['accuracy'])
 
 history = model.fit(
     train_ds,
     validation_data=val_ds,
-    epochs=13
+    epochs=10
 )
 
 for layer in model.layers:
     layer.trainable = True
 
-sgd = keras.optimizers.legacy.SGD(lr=2e-3, 
-                               decay=1e-9,
-                               momentum=0.9)    
+#sgd = keras.optimizers.legacy.SGD(lr=5e-6, 
+#                               decay=1e-9,
+#                               momentum=0.9)    
     
 model.compile(loss="sparse_categorical_crossentropy", 
-                           optimizer=sgd,
+                           optimizer=tf.keras.optimizers.Adam(learning_rate=4.7e-5),
                            metrics=['accuracy'])
 
 print('train')
@@ -239,18 +383,32 @@ print('train')
 fine_tune_history = model.fit(
     train_ds,
     validation_data=val_ds,
-    epochs=30
+    epochs=20
 )
 
-model.save('/home/ignas/VU/Master/AI/fgvc_bilinear_vgg_finetuned.keras')
+model.save('/home/ignas/VU/Master/AI/fgvc_bilinear_vgg_stn.keras')
 
 import numpy as np
 
 """Test"""
 
+print('test')
+
 import tensorflow as tf
 
-model = tf.keras.models.load_model('/home/ignas/VU/Master/AI/fgvc_bilinear_vgg_finetuned.keras', safe_mode=False)
+model = tf.keras.models.load_model(
+    '/home/ignas/VU/Master/AI/fgvc_bilinear_vgg_stn.keras',
+    safe_mode=False,
+    custom_objects={
+        "Localization": Localization,
+        "BilinearInterpolation": BilinearInterpolation,
+        "dot_product": dot_product,
+        "signed_sqrt": signed_sqrt,
+        "L2_norm": L2_norm
+    }
+)
+
+#model = tf.keras.models.load_model('/home/ignas/VU/Master/AI/fgvc_bilinear_vgg_finetuned.keras', safe_mode=False)
 print("Model loaded")
 
 import os
